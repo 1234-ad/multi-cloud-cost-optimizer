@@ -1,0 +1,354 @@
+# Multi-Cloud Cost Optimizer - Docker Compose Configuration
+# ========================================================
+# 
+# Complete development environment with all services
+# Run with: docker-compose up -d
+
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: mcco-postgres
+    environment:
+      POSTGRES_DB: cost_optimizer
+      POSTGRES_USER: mcco_user
+      POSTGRES_PASSWORD: mcco_password
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - mcco-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mcco_user -d cost_optimizer"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: mcco-redis
+    command: redis-server --appendonly yes --requirepass mcco_redis_password
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - mcco-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # InfluxDB for Time Series Data
+  influxdb:
+    image: influxdb:2.7-alpine
+    container_name: mcco-influxdb
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: mcco_admin
+      DOCKER_INFLUXDB_INIT_PASSWORD: mcco_influx_password
+      DOCKER_INFLUXDB_INIT_ORG: mcco
+      DOCKER_INFLUXDB_INIT_BUCKET: cost_metrics
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: mcco_super_secret_token
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+    ports:
+      - "8086:8086"
+    networks:
+      - mcco-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8086/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: mcco-backend
+    environment:
+      # Database Configuration
+      DATABASE_URL: postgresql://mcco_user:mcco_password@postgres:5432/cost_optimizer
+      REDIS_URL: redis://:mcco_redis_password@redis:6379/0
+      INFLUXDB_URL: http://influxdb:8086
+      INFLUXDB_TOKEN: mcco_super_secret_token
+      INFLUXDB_ORG: mcco
+      INFLUXDB_BUCKET: cost_metrics
+      
+      # API Configuration
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      API_TOKEN: mcco_api_token_dev
+      SECRET_KEY: mcco_super_secret_key_for_development
+      
+      # Cloud Provider Configuration
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      
+      AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:-}
+      AZURE_CLIENT_SECRET: ${AZURE_CLIENT_SECRET:-}
+      AZURE_TENANT_ID: ${AZURE_TENANT_ID:-}
+      AZURE_SUBSCRIPTION_ID: ${AZURE_SUBSCRIPTION_ID:-}
+      
+      GCP_PROJECT_ID: ${GCP_PROJECT_ID:-}
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
+      
+      # Application Configuration
+      ENVIRONMENT: development
+      DEBUG: "true"
+      LOG_LEVEL: INFO
+      ALLOWED_ORIGINS: "http://localhost:3000,http://localhost:8080"
+      
+      # ML Model Configuration
+      MODEL_PATH: /app/models
+      ENABLE_ML_TRAINING: "true"
+      
+      # Background Tasks
+      CELERY_BROKER_URL: redis://:mcco_redis_password@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:mcco_redis_password@redis:6379/2
+      
+    volumes:
+      - ./backend:/app
+      - ml_models:/app/models
+      - ./logs:/app/logs
+    ports:
+      - "8000:8000"
+    networks:
+      - mcco-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      influxdb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # Celery Worker for Background Tasks
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: mcco-celery-worker
+    command: celery -A app.core.celery worker --loglevel=info --concurrency=4
+    environment:
+      # Same environment as backend
+      DATABASE_URL: postgresql://mcco_user:mcco_password@postgres:5432/cost_optimizer
+      REDIS_URL: redis://:mcco_redis_password@redis:6379/0
+      CELERY_BROKER_URL: redis://:mcco_redis_password@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:mcco_redis_password@redis:6379/2
+      
+      # Cloud credentials
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:-}
+      AZURE_CLIENT_SECRET: ${AZURE_CLIENT_SECRET:-}
+      AZURE_TENANT_ID: ${AZURE_TENANT_ID:-}
+      GCP_PROJECT_ID: ${GCP_PROJECT_ID:-}
+      
+      ENVIRONMENT: development
+      LOG_LEVEL: INFO
+    volumes:
+      - ./backend:/app
+      - ml_models:/app/models
+      - ./logs:/app/logs
+    networks:
+      - mcco-network
+    depends_on:
+      - postgres
+      - redis
+      - backend
+    restart: unless-stopped
+
+  # Celery Beat for Scheduled Tasks
+  celery-beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: mcco-celery-beat
+    command: celery -A app.core.celery beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    environment:
+      DATABASE_URL: postgresql://mcco_user:mcco_password@postgres:5432/cost_optimizer
+      CELERY_BROKER_URL: redis://:mcco_redis_password@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:mcco_redis_password@redis:6379/2
+      ENVIRONMENT: development
+      LOG_LEVEL: INFO
+    volumes:
+      - ./backend:/app
+      - ./logs:/app/logs
+    networks:
+      - mcco-network
+    depends_on:
+      - postgres
+      - redis
+      - backend
+    restart: unless-stopped
+
+  # Frontend React Application
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: mcco-frontend
+    environment:
+      REACT_APP_API_URL: http://localhost:8000
+      REACT_APP_WS_URL: ws://localhost:8000
+      REACT_APP_ENVIRONMENT: development
+      GENERATE_SOURCEMAP: "false"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "3000:3000"
+    networks:
+      - mcco-network
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: mcco-nginx
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/conf.d:/etc/nginx/conf.d
+      - ./logs/nginx:/var/log/nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - mcco-network
+    depends_on:
+      - backend
+      - frontend
+    restart: unless-stopped
+
+  # Prometheus for Metrics
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: mcco-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - mcco-network
+    restart: unless-stopped
+
+  # Grafana for Visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: mcco-grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: mcco_grafana_admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_INSTALL_PLUGINS: grafana-clock-panel,grafana-simple-json-datasource
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+    ports:
+      - "3001:3000"
+    networks:
+      - mcco-network
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  # Node Exporter for System Metrics
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: mcco-node-exporter
+    command:
+      - '--path.rootfs=/host'
+    volumes:
+      - '/:/host:ro,rslave'
+    ports:
+      - "9100:9100"
+    networks:
+      - mcco-network
+    restart: unless-stopped
+
+  # cAdvisor for Container Metrics
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: mcco-cadvisor
+    privileged: true
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /cgroup:/cgroup:ro
+    ports:
+      - "8080:8080"
+    networks:
+      - mcco-network
+    restart: unless-stopped
+
+  # Jupyter Notebook for ML Development
+  jupyter:
+    build:
+      context: ./ml-models
+      dockerfile: Dockerfile
+    container_name: mcco-jupyter
+    environment:
+      JUPYTER_ENABLE_LAB: "yes"
+      JUPYTER_TOKEN: mcco_jupyter_token
+    volumes:
+      - ./ml-models:/home/jovyan/work
+      - ml_models:/home/jovyan/models
+    ports:
+      - "8888:8888"
+    networks:
+      - mcco-network
+    restart: unless-stopped
+
+# Networks
+networks:
+  mcco-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# Volumes
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  influxdb_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  ml_models:
+    driver: local
